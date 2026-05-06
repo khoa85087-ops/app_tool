@@ -1,129 +1,208 @@
 #![windows_subsystem = "windows"]
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    thread,
-    time::{Duration, Instant},
-};
+use std::mem::{size_of, zeroed};
 
-use sysinfo::{
-    ProcessRefreshKind,
-    RefreshKind,
-    System,
-};
+use winapi::shared::minwindef::*;
+use winapi::shared::windef::*;
+use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use winapi::um::processthreadsapi::GetSystemTimes;
+use winapi::um::wingdi::*;
+use winapi::um::winuser::*;
 
-use windows::{
-    Win32::{
-        Foundation::{BOOL, HWND, LPARAM},
-        UI::WindowsAndMessaging::{
-            EnumWindows,
-            GetWindowTextLengthW,
-            GetWindowTextW,
-            GetWindowThreadProcessId,
-            IsWindowVisible,
-        },
-    },
-};
+static mut CPU: f32 = 0.0;
+static mut RAM: f32 = 0.0;
 
-fn load_watchlist(path: &str) -> HashSet<String> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
+static mut LAST_IDLE: u64 = 0;
+static mut LAST_TOTAL: u64 = 0;
 
-unsafe extern "system" fn enum_windows_proc(
-    hwnd: HWND,
-    lparam: LPARAM,
-) -> BOOL {
-    if !IsWindowVisible(hwnd).as_bool() {
-        return BOOL(1);
-    }
+const W: i32 = 120;
+const H: i32 = 44;
 
-    let len = GetWindowTextLengthW(hwnd);
+const BG: COLORREF = 0x00202020;
+const TXT: COLORREF = 0x00F2F2F2;
 
-    if len == 0 {
-        return BOOL(1);
-    }
-
-    let mut buffer = vec![0u16; (len + 1) as usize];
-
-    GetWindowTextW(hwnd, &mut buffer);
-
-    let mut pid = 0u32;
-
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-    let pids = &mut *(lparam.0 as *mut HashSet<u32>);
-
-    pids.insert(pid);
-
-    BOOL(1)
-}
-
-fn get_visible_window_pids() -> HashSet<u32> {
-    let mut pids = HashSet::new();
-
+// ===== CPU =====
+fn cpu_usage() -> f32 {
     unsafe {
-        EnumWindows(
-            Some(enum_windows_proc),
-            LPARAM(&mut pids as *mut _ as isize),
-        );
-    }
+        let mut i = zeroed();
+        let mut k = zeroed();
+        let mut u = zeroed();
 
-    pids
-}
+        GetSystemTimes(&mut i, &mut k, &mut u);
 
-fn main() {
-    let watchlist = load_watchlist("watchlist.txt");
+        let i = ((i.dwHighDateTime as u64) << 32) | i.dwLowDateTime as u64;
+        let k = ((k.dwHighDateTime as u64) << 32) | k.dwLowDateTime as u64;
+        let u = ((u.dwHighDateTime as u64) << 32) | u.dwLowDateTime as u64;
 
-    let mut system = System::new_with_specifics(
-        RefreshKind::new()
-            .with_processes(ProcessRefreshKind::new()),
-    );
+        let total = k + u;
 
-    // lưu thời gian phát hiện process nền
-    let mut hidden_since: HashMap<u32, Instant> = HashMap::new();
-
-    loop {
-        let visible_pids = get_visible_window_pids();
-
-        system.refresh_processes_specifics(
-            ProcessRefreshKind::new(),
-        );
-
-        for process in system.processes().values() {
-            let name = process.name().to_lowercase();
-
-            if !watchlist.contains(&name) {
-                continue;
-            }
-
-            let pid = process.pid().as_u32();
-
-            // đang mở cửa sổ
-            if visible_pids.contains(&pid) {
-                hidden_since.remove(&pid);
-                continue;
-            }
-
-            // chưa có thì ghi thời gian
-            hidden_since
-                .entry(pid)
-                .or_insert_with(Instant::now);
-
-            // nếu nền > 20 giây mới kill
-            if let Some(start) = hidden_since.get(&pid) {
-                if start.elapsed() > Duration::from_secs(20) {
-                    let _ = process.kill();
-                    hidden_since.remove(&pid);
-                }
-            }
+        if LAST_TOTAL == 0 {
+            LAST_IDLE = i;
+            LAST_TOTAL = total;
+            return 0.0;
         }
 
-        thread::sleep(Duration::from_secs(10));
+        let di = i - LAST_IDLE;
+        let dt = total - LAST_TOTAL;
+
+        LAST_IDLE = i;
+        LAST_TOTAL = total;
+
+        if dt == 0 { 0.0 } else {
+            ((dt - di) as f32 / dt as f32) * 100.0
+        }
+    }
+}
+
+// ===== RAM =====
+fn ram_usage() -> f32 {
+    unsafe {
+        let mut m: MEMORYSTATUSEX = zeroed();
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        GlobalMemoryStatusEx(&mut m);
+        m.dwMemoryLoad as f32
+    }
+}
+
+// ===== WINDOW =====
+unsafe extern "system" fn proc(
+    hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM
+) -> LRESULT {
+    match msg {
+
+        WM_CREATE => {
+            CPU = cpu_usage();
+            RAM = ram_usage();
+            0
+        }
+
+        WM_TIMER => {
+            CPU = cpu_usage();
+            RAM = ram_usage();
+
+            // 🔥 FIX ẨN: luôn giữ topmost
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+
+            InvalidateRect(hwnd, std::ptr::null_mut(), FALSE);
+            0
+        }
+
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+
+            let b = CreateSolidBrush(BG);
+            let mut rc: RECT = zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(hdc, &rc, b);
+            DeleteObject(b as _);
+
+            let name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+            let f = CreateFontW(
+                16, 0, 0, 0,
+                FW_MEDIUM as i32,
+                0, 0, 0,
+                DEFAULT_CHARSET as u32,
+                OUT_TT_ONLY_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH | FF_DONTCARE,
+                name.as_ptr(),
+            );
+
+            let old = SelectObject(hdc, f as _);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, TXT);
+
+            let s1 = format!("CPU {}%", CPU as i32);
+            let s2 = format!("RAM {}%", RAM as i32);
+
+            let w1: Vec<u16> = s1.encode_utf16().collect();
+            let w2: Vec<u16> = s2.encode_utf16().collect();
+
+            TextOutW(hdc, 10, 6, w1.as_ptr(), w1.len() as i32);
+            TextOutW(hdc, 10, 24, w2.as_ptr(), w2.len() as i32);
+
+            SelectObject(hdc, old);
+            DeleteObject(f as _);
+
+            EndPaint(hwnd, &ps);
+            0
+        }
+
+        WM_LBUTTONDOWN => {
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
+            0
+        }
+
+        WM_RBUTTONUP | WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+
+        _ => DefWindowProcW(hwnd, msg, w, l)
+    }
+}
+
+// ===== MAIN =====
+fn main() {
+    unsafe {
+        let cls: Vec<u16> = "Overlay\0".encode_utf16().collect();
+        let title: Vec<u16> = "overlay\0".encode_utf16().collect();
+
+        let h = GetModuleHandleW(std::ptr::null_mut());
+
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(proc),
+            hInstance: h,
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            lpszClassName: cls.as_ptr(),
+            ..zeroed()
+        };
+
+        RegisterClassExW(&wc);
+
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            cls.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            10,
+            sh - H,
+            W, H,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            h,
+            std::ptr::null_mut(),
+        );
+
+        // 🔥 đảm bảo nổi ngay từ đầu
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(hwnd);
+
+        SetTimer(hwnd, 1, 1000, None);
+
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 }
