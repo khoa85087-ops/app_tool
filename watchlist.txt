@@ -1,0 +1,5 @@
+Zalo.exe
+Discord.exe
+Steam.exe
+Spotify.exe
+ProtonVPN.Client.exe
