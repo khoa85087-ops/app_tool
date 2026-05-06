@@ -1,0 +1,36 @@
+[package]
+name = "cpu-ram-overlay"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cpu-ram-overlay"
+path = "src/main.rs"
+
+[dependencies]
+winapi = { version = "0.3", features = [
+    "winuser",
+    "wingdi",
+    "windef",
+    "winbase",
+    "processthreadsapi",
+    "sysinfoapi",
+    "handleapi",
+    "pdh",
+    "libloaderapi",
+    "dwmapi",
+    "shellapi",
+      "winuser",
+    "wingdi",
+    "sysinfoapi",
+    "libloaderapi",
+    "processthreadsapi"   # 🔥 thêm dòng này
+
+] }
+
+[profile.release]
+opt-level = "z"       # Tối ưu kích thước nhỏ nhất
+lto = true            # Link-time optimization
+codegen-units = 1     # Tối ưu tốt hơn
+panic = "abort"       # Bỏ unwind stack, nhỏ hơn
+strip = true          # Strip debug symbols
