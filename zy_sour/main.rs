@@ -10,6 +10,9 @@ use argon2::{
         SaltString,
     },
     Argon2,
+    Algorithm,
+    Params,
+    Version,
 };
 
 use eframe::egui;
@@ -21,9 +24,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aes_gcm::{Aes256Gcm, Nonce, KeyInit};
 use aes_gcm::aead::Aead;
 use hex;
+use zeroize::Zeroize;
+use std::thread;
+use std::time::Duration;
 
 const VAULT_FILE: &str = "vault.json";
 const SESSION_TIMEOUT_SECS: u64 = 600;
+const CLIPBOARD_CLEAR_SECS: u64 = 60;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Entry {
@@ -60,9 +67,12 @@ struct VaultApp {
     setup_password: String,
     setup_confirm: String,
     failed_attempts: u32,
-lock_until: u64,
-current_lock_minutes: u64,
+    lock_until: u64,
+    current_lock_minutes: u64,
+    
+    clipboard_clear_time: Option<u64>,
 }
+
 fn get_current_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -70,15 +80,29 @@ fn get_current_time() -> u64 {
         .as_secs()
 }
 
+fn get_argon2_strong() -> Argon2<'static> {
+    // Option 2: Strong config (1-2 giây)
+    let params = Params::new(
+        262144, // m_cost: 256 MiB memory
+        4,      // t_cost: 4 iterations
+        2,      // p_cost: 2 parallelism (multi-core)
+        None
+    ).expect("Invalid argon2 params");
+
+    Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        params,
+    )
+}
+
 fn derive_encryption_key(
     master_password: &str,
     salt: &str,
 ) -> Vec<u8> {
-    use argon2::Argon2;
-
     let mut output_key = [0u8; 32];
 
-    Argon2::default()
+    get_argon2_strong()
         .hash_password_into(
             master_password.as_bytes(),
             salt.as_bytes(),
@@ -140,7 +164,7 @@ fn decrypt_password(encrypted: &str, key: &[u8]) -> Result<String, String> {
 fn create_hash(password: &str) -> Result<String, String> {
     let salt = SaltString::generate(&mut OsRng);
 
-    Argon2::default()
+    get_argon2_strong()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|_| "Lỗi tạo hash".to_string())
@@ -149,7 +173,7 @@ fn create_hash(password: &str) -> Result<String, String> {
 fn verify(hash: &str, password: &str) -> bool {
     match PasswordHash::new(hash) {
         Ok(parsed) => {
-            Argon2::default()
+            get_argon2_strong()
                 .verify_password(password.as_bytes(), &parsed)
                 .is_ok()
         }
@@ -162,13 +186,23 @@ fn paste_text(text: String) -> Result<(), String> {
         .map_err(|_| "Lỗi truy cập clipboard".to_string())?;
 
     clipboard
-        .set_text(text)
+        .set_text(text.clone())
         .map_err(|_| "Lỗi sao chép".to_string())?;
+
+    thread::sleep(Duration::from_millis(100));
 
     let mut enigo = Enigo::new();
     enigo.key_down(enigo::Key::Control);
     enigo.key_click(enigo::Key::Layout('v'));
     enigo.key_up(enigo::Key::Control);
+
+    // Clear clipboard after 60 seconds
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+        if let Ok(mut clipboard) = Clipboard::new() {
+            let _ = clipboard.set_text("".to_string());
+        }
+    });
 
     Ok(())
 }
@@ -236,8 +270,9 @@ impl Default for VaultApp {
             setup_password: String::new(),
             setup_confirm: String::new(),
             failed_attempts: 0,
-lock_until: 0,
-current_lock_minutes: 5,
+            lock_until: 0,
+            current_lock_minutes: 5,
+            clipboard_clear_time: None,
         }
     }
 }
@@ -253,7 +288,11 @@ impl eframe::App for VaultApp {
 
             if now - self.last_activity > SESSION_TIMEOUT_SECS {
                 self.unlocked = false;
-                self.encryption_key = None;
+                
+                if let Some(mut key) = self.encryption_key.take() {
+                    key.zeroize();
+                }
+                
                 self.entries.clear();
                 self.message =
                     "⏱️ Session hết hạn".to_string();
@@ -355,6 +394,9 @@ impl VaultApp {
                             format!("❌ {}", e);
                     }
                 }
+                
+                self.setup_password.zeroize();
+                self.setup_confirm.zeroize();
             }
         }
 
@@ -362,93 +404,93 @@ impl VaultApp {
     }
 
     fn render_unlock_screen(
-    &mut self,
-    ui: &mut egui::Ui,
-) {
-    let now = get_current_time();
+        &mut self,
+        ui: &mut egui::Ui,
+    ) {
+        let now = get_current_time();
 
-    if now < self.lock_until {
-        let remain = self.lock_until - now;
+        if now < self.lock_until {
+            let remain = self.lock_until - now;
 
-        ui.label(format!(
-            "⛔ Đang bị khóa. Chờ {} phút {} giây",
-            remain / 60,
-            remain % 60
-        ));
+            ui.label(format!(
+                "⛔ Đang bị khóa. Chờ {} phút {} giây",
+                remain / 60,
+                remain % 60
+            ));
 
-        ui.label(&self.message);
-        return;
-    }
-
-    ui.label("Nhập mật khẩu chính");
-
-    ui.add_space(15.0);
-
-    ui.add_sized(
-        [300.0, 40.0],
-        egui::TextEdit::singleline(
-            &mut self.input
-        )
-        .password(true)
-        .hint_text("Mật khẩu"),
-    );
-
-    ui.add_space(10.0);
-
-    if ui.button("Mở khóa").clicked() {
-        if verify(
-            &self.data.master_hash,
-            &self.input,
-        ) {
-            let key = derive_encryption_key(
-                &self.input,
-                &self.data.salt,
-            );
-
-            self.encryption_key = Some(key);
-            self.unlocked = true;
-            self.entries =
-                self.data.entries.clone();
-
-            self.message =
-                "✅ Đã mở khóa".to_string();
-
-            self.failed_attempts = 0;
-            self.current_lock_minutes = 5;
-        } else {
-            self.failed_attempts += 1;
-
-            if self.failed_attempts >= 5 {
-                let minutes =
-                    self.current_lock_minutes
-                        * self.current_lock_minutes;
-
-                self.lock_until =
-                    get_current_time()
-                        + (minutes * 60);
-
-                self.message = format!(
-                    "⛔ Sai 5 lần. Khóa {} phút",
-                    minutes
-                );
-
-                self.failed_attempts = 0;
-
-                self.current_lock_minutes =
-                    minutes;
-            } else {
-                self.message = format!(
-                    "❌ Sai mật khẩu ({}/5)",
-                    self.failed_attempts
-                );
-            }
+            ui.label(&self.message);
+            return;
         }
 
-        self.input.clear();
-    }
+        ui.label("Nhập mật khẩu chính");
 
-    ui.label(&self.message);
-}
+        ui.add_space(15.0);
+
+        ui.add_sized(
+            [300.0, 40.0],
+            egui::TextEdit::singleline(
+                &mut self.input
+            )
+            .password(true)
+            .hint_text("Mật khẩu"),
+        );
+
+        ui.add_space(10.0);
+
+        if ui.button("Mở khóa").clicked() {
+            if verify(
+                &self.data.master_hash,
+                &self.input,
+            ) {
+                let key = derive_encryption_key(
+                    &self.input,
+                    &self.data.salt,
+                );
+
+                self.encryption_key = Some(key);
+                self.unlocked = true;
+                self.entries =
+                    self.data.entries.clone();
+
+                self.message =
+                    "✅ Đã mở khóa".to_string();
+
+                self.failed_attempts = 0;
+                self.current_lock_minutes = 5;
+            } else {
+                self.failed_attempts += 1;
+
+                if self.failed_attempts >= 5 {
+                    let minutes =
+                        self.current_lock_minutes
+                            * self.current_lock_minutes;
+
+                    self.lock_until =
+                        get_current_time()
+                            + (minutes * 60);
+
+                    self.message = format!(
+                        "⛔ Sai 5 lần. Khóa {} phút",
+                        minutes
+                    );
+
+                    self.failed_attempts = 0;
+
+                    self.current_lock_minutes =
+                        minutes;
+                } else {
+                    self.message = format!(
+                        "❌ Sai mật khẩu ({}/5)",
+                        self.failed_attempts
+                    );
+                }
+            }
+
+            self.input.zeroize();
+        }
+
+        ui.label(&self.message);
+    }
 
     fn render_main_screen(
         &mut self,
@@ -517,7 +559,8 @@ impl VaultApp {
 
                         self.new_platform.clear();
                         self.new_account.clear();
-                        self.new_password.clear();
+                        
+                        self.new_password.zeroize();
                     }
                     Err(e) => {
                         self.message =
@@ -620,55 +663,67 @@ impl VaultApp {
         );
 
         if ui.button("Cập nhật mật khẩu").clicked() {
-    if self.change_password
-        != self.confirm_password
-    {
-        self.message =
-            "❌ Mật khẩu không khớp"
-                .to_string();
+            if self.change_password
+                != self.confirm_password
+            {
+                self.message =
+                    "❌ Mật khẩu không khớp"
+                        .to_string();
 
-        return;
-    }
+                return;
+            }
 
-    if let Some(old_key) =
-        &self.encryption_key
-    {
-        let new_key =
-            derive_encryption_key(
-                &self.change_password,
-                &self.data.salt,
-            );
+            if let Some(old_key) =
+                &self.encryption_key
+            {
+                let new_key =
+                    derive_encryption_key(
+                        &self.change_password,
+                        &self.data.salt,
+                    );
 
-        let mut new_entries = vec![];
+                let mut new_entries = vec![];
 
-        for entry in &self.data.entries {
-            match decrypt_password(
-                &entry.encrypted_password,
-                old_key,
-            ) {
-                Ok(password) => {
-                    match encrypt_password(
-                        &password,
-                        &new_key,
+                for entry in &self.data.entries {
+                    match decrypt_password(
+                        &entry.encrypted_password,
+                        old_key,
                     ) {
-                        Ok(new_encrypted) => {
-                            new_entries.push(
-                                Entry {
-                                    platform:
-                                        entry
-                                            .platform
-                                            .clone(),
-                                    account:
-                                        entry
-                                            .account
-                                            .clone(),
-                                    encrypted_password:
-                                        new_encrypted,
-                                },
-                            );
+                        Ok(password) => {
+                            match encrypt_password(
+                                &password,
+                                &new_key,
+                            ) {
+                                Ok(new_encrypted) => {
+                                    new_entries.push(
+                                        Entry {
+                                            platform:
+                                                entry
+                                                    .platform
+                                                    .clone(),
+                                            account:
+                                                entry
+                                                    .account
+                                                    .clone(),
+                                            encrypted_password:
+                                                new_encrypted,
+                                        },
+                                    );
+                                }
+
+                                Err(e) => {
+                                    self.message =
+                                        format!(
+                                            "❌ {}",
+                                            e
+                                        );
+
+                                    return;
+                                }
+                            }
                         }
 
-                                      Err(e) => {
+                        Err(e) => {
                             self.message =
                                 format!(
                                     "❌ {}",
@@ -680,62 +735,50 @@ impl VaultApp {
                     }
                 }
 
-                Err(e) => {
-                    self.message =
-                        format!(
-                            "❌ {}",
-                            e
-                        );
+                match create_hash(
+                    &self.change_password
+                ) {
+                    Ok(new_hash) => {
+                        self.data.master_hash =
+                            new_hash;
 
-                    return;
+                        self.data.entries =
+                            new_entries.clone();
+
+                        self.entries =
+                            new_entries;
+
+                        let mut old_key_copy = self.encryption_key.take().unwrap();
+                        old_key_copy.zeroize();
+
+                        self.encryption_key =
+                            Some(new_key);
+
+                        let _ = save(&self.data);
+
+                        self.message =
+                            "✅ Đã cập nhật mật khẩu"
+                                .to_string();
+
+                        self.change_password.zeroize();
+                        self.confirm_password.zeroize();
+                    }
+
+                    Err(e) => {
+                        self.message =
+                            format!("❌ {}", e);
+                    }
                 }
             }
         }
 
-        match create_hash(
-            &self.change_password
-        ) {
-            Ok(new_hash) => {
-                self.data.master_hash =
-                    new_hash;
-
-                self.data.entries =
-                    new_entries.clone();
-
-                self.entries =
-                    new_entries;
-
-                self.encryption_key =
-                    Some(new_key);
-
-                let _ = save(&self.data);
-
-                self.message =
-                    "✅ Đã cập nhật mật khẩu"
-                        .to_string();
-
-                self.change_password
-                    .clear();
-
-                self.confirm_password
-                    .clear();
-            }
-
-            Err(e) => {
-                self.message =
-                    format!("❌ {}", e);
-            }
-        }
-    
-
-               
-    }
-}            
-
         if ui.button("🔓 Đăng xuất").clicked() {
             self.unlocked = false;
             self.entries.clear();
-            self.encryption_key = None;
+            
+            if let Some(mut key) = self.encryption_key.take() {
+                key.zeroize();
+            }
         }
 
         ui.label(&self.message);
@@ -744,21 +787,20 @@ impl VaultApp {
 
 fn main() {
     let icon = from_png_bytes(
-    include_bytes!("../icon.png")
-).unwrap();
+        include_bytes!("../icon.png")
+    ).unwrap();
 
-let options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default()
-        .with_icon(icon),
-    ..Default::default()
-};
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(icon),
+        ..Default::default()
+    };
 
     let _ = eframe::run_native(
-         "xz pass",
+        "xz pass",
         options,
         Box::new(|cc| {
 
-            // FIX FONT TIẾNG VIỆT
             let mut fonts = FontDefinitions::default();
 
             fonts.font_data.insert(
