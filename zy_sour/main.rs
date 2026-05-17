@@ -70,13 +70,23 @@ fn get_current_time() -> u64 {
         .as_secs()
 }
 
-fn derive_encryption_key(master_password: &str, salt: &str) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
+fn derive_encryption_key(
+    master_password: &str,
+    salt: &str,
+) -> Vec<u8> {
+    use argon2::Argon2;
 
-    let combined = format!("{}{}", master_password, salt);
-    let mut hasher = Sha256::new();
-    hasher.update(combined.as_bytes());
-    hasher.finalize().to_vec()
+    let mut output_key = [0u8; 32];
+
+    Argon2::default()
+        .hash_password_into(
+            master_password.as_bytes(),
+            salt.as_bytes(),
+            &mut output_key,
+        )
+        .expect("derive key failed");
+
+    output_key.to_vec()
 }
 
 fn encrypt_password(password: &str, key: &[u8]) -> Result<String, String> {
