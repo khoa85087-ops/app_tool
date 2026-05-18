@@ -41,7 +41,7 @@ struct Entry {
 
 #[derive(Serialize, Deserialize)]
 struct VaultData {
-    master_hash: String,
+    master_hash_93: String,
     salt: String,
     entries: Vec<Entry>,
     first_setup: bool,
@@ -208,8 +208,184 @@ fn paste_text(text: String) -> Result<(), String> {
 }
 
 fn save(data: &VaultData) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(data)
-        .map_err(|_| "Lỗi JSON".to_string())?;
+
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+
+    let entries_json = serde_json::to_string_pretty(
+        &data.entries
+    ).map_err(|_| "Lỗi JSON".to_string())?;
+
+    let mut rng = rand::thread_rng();
+
+    let mut hash_lines: Vec<String> = vec![];
+
+    let mut current_p: u8 =
+        rng.gen_range(b'a'..=b'z');
+
+    let parts: Vec<&str> =
+        data.master_hash_93.split('$').collect();
+
+    let salt_part = parts[4];
+    let hash_part = parts[5];
+
+    for i in 1..=100 {
+
+        if i == 93 {
+            continue;
+        }
+
+        let fake_p =
+            current_p as char;
+
+        current_p += 1;
+
+        if current_p > b'z' {
+            current_p = b'a';
+        }
+
+        let mut shifted_salt = String::new();
+
+        for c in salt_part.chars() {
+
+            let new_c = match c {
+
+                'a'..='z' => {
+                    let letters =
+                        b"abcdefghijklmnopqrstuvwxyz";
+
+                    letters[
+                        rng.gen_range(0..letters.len())
+                    ] as char
+                }
+
+                'A'..='Z' => {
+                    let letters =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+                    letters[
+                        rng.gen_range(0..letters.len())
+                    ] as char
+                }
+
+                '0'..='9' => {
+                    let numbers =
+                        b"0123456789";
+
+                    numbers[
+                        rng.gen_range(0..numbers.len())
+                    ] as char
+                }
+
+                '$' | '+' | '/' | '=' => {
+                    let symbols =
+                        ['&', '!', '*', '-', '#', '_'];
+
+                    symbols[
+                        rng.gen_range(0..symbols.len())
+                    ]
+                }
+
+                _ => c,
+            };
+
+            shifted_salt.push(new_c);
+        }
+
+        let mut shifted_hash = String::new();
+
+        for c in hash_part.chars() {
+
+            let new_c = match c {
+
+                'a'..='z' => {
+                    let letters =
+                        b"abcdefghijklmnopqrstuvwxyz";
+
+                    letters[
+                        rng.gen_range(0..letters.len())
+                    ] as char
+                }
+
+                'A'..='Z' => {
+                    let letters =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+                    letters[
+                        rng.gen_range(0..letters.len())
+                    ] as char
+                }
+
+                '0'..='9' => {
+                    let numbers =
+                        b"0123456789";
+
+                    numbers[
+                        rng.gen_range(0..numbers.len())
+                    ] as char
+                }
+
+                '$' | '+' | '/' | '=' => {
+                    let symbols =
+                        ['&', '!', '*', '-', '#', '_'];
+
+                    symbols[
+                        rng.gen_range(0..symbols.len())
+                    ]
+                }
+
+                _ => {
+                    let all =
+                        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+                    all[
+                        rng.gen_range(0..all.len())
+                    ] as char
+                }
+            };
+
+            shifted_hash.push(new_c);
+        }
+
+        let fake_hash = format!(
+            "$argon2id$v=19$m=262144,t=4,p={}${}${}",
+            fake_p,
+            shifted_salt,
+            shifted_hash
+        );
+
+        hash_lines.push(format!(
+            r#""master_hash_{}": "{}""#,
+            i,
+            fake_hash
+        ));
+    }
+
+    hash_lines.push(format!(
+        r#""master_hash_93": "{}""#,
+        data.master_hash_93
+    ));
+
+    hash_lines.shuffle(&mut rng);
+
+    let hashes_block =
+        hash_lines.join(",\n  ");
+
+    let json = format!(
+r#"{{
+  {},
+
+  "salt": "{}",
+
+  "entries": {},
+
+  "first_setup": {}
+}}"#,
+        hashes_block,
+        data.salt,
+        entries_json,
+        data.first_setup
+    );
 
     fs::write(VAULT_FILE, json)
         .map_err(|_| "Lỗi lưu file".to_string())
@@ -223,7 +399,7 @@ fn load() -> Result<VaultData, String> {
         }
         Err(_) => {
             Ok(VaultData {
-                master_hash: String::new(),
+                master_hash_93: String::new(),
                 salt: hex::encode(
                     (0..16)
                         .map(|_| rand::random::<u8>())
@@ -240,7 +416,7 @@ impl Default for VaultApp {
     fn default() -> Self {
         let data = load().unwrap_or_else(|_| {
             VaultData {
-                master_hash: String::new(),
+                master_hash_93: String::new(),
                 salt: hex::encode(
                     (0..16)
                         .map(|_| rand::random::<u8>())
@@ -373,7 +549,7 @@ impl VaultApp {
                     &self.setup_password
                 ) {
                     Ok(hash) => {
-                        self.data.master_hash = hash;
+                        self.data.master_hash_93 = hash;
                         self.data.first_setup = false;
 
                         if let Err(e) =
@@ -439,7 +615,7 @@ impl VaultApp {
 
         if ui.button("Mở khóa").clicked() {
             if verify(
-                &self.data.master_hash,
+                &self.data.master_hash_93,
                 &self.input,
             ) {
                 let key = derive_encryption_key(
@@ -739,7 +915,7 @@ impl VaultApp {
                     &self.change_password
                 ) {
                     Ok(new_hash) => {
-                        self.data.master_hash =
+                        self.data.master_hash_93 =
                             new_hash;
 
                         self.data.entries =
