@@ -1,0 +1,6 @@
+Set-Service wuauserv -StartupType Manual
+Set-Service UsoSvc -StartupType Manual
+Set-Service bits -StartupType Manual
+
+Start-Service wuauserv
+Start-Service bits
